@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,19 +16,18 @@
 
 -module(emqx_bridge_worker_SUITE).
 
--export([ all/0
-        , init_per_suite/1
-        , end_per_suite/1]).
--export([ t_rpc/1
-        , t_mqtt/1
-        , t_mngr/1]).
+-compile(export_all).
+-compile(nowarn_export_all).
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
 -include_lib("emqx/include/emqx.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -define(wait(For, Timeout), emqx_ct_helpers:wait_for(?FUNCTION_NAME, ?LINE, fun() -> For end, Timeout)).
+
+-define(SNK_WAIT(WHAT), ?assertMatch({ok, _}, ?block_until(#{?snk_kind := WHAT}, 5000, 5000))).
 
 receive_messages(Count) ->
     receive_messages(Count, []).
@@ -45,10 +44,15 @@ receive_messages(Count, Msgs) ->
         Msgs
     end.
 
-all() -> [ t_rpc
-         , t_mqtt
-         , t_mngr
-         ].
+all() ->
+    lists:filtermap(
+      fun({FunName, _Arity}) ->
+              case atom_to_list(FunName) of
+                  "t_" ++ _ -> {true, FunName};
+                  _ -> false
+              end
+      end,
+      ?MODULE:module_info(exports)).
 
 init_per_suite(Config) ->
     case node() of
@@ -56,12 +60,19 @@ init_per_suite(Config) ->
         _ -> ok
     end,
     ok = application:set_env(gen_rpc, tcp_client_num, 1),
-    emqx_ct_helpers:start_apps([emqx_bridge_mqtt]),
+    emqx_ct_helpers:start_apps([emqx_modules, emqx_bridge_mqtt]),
     emqx_logger:set_log_level(error),
     [{log_level, error} | Config].
 
 end_per_suite(_Config) ->
-    emqx_ct_helpers:stop_apps([emqx_bridge_mqtt]).
+    emqx_ct_helpers:stop_apps([emqx_bridge_mqtt, emqx_modules]).
+
+init_per_testcase(_TestCase, Config) ->
+    ok = snabbkaffe:start_trace(),
+    Config.
+
+end_per_testcase(_TestCase, _Config) ->
+    ok = snabbkaffe:stop().
 
 t_mngr(Config) when is_list(Config) ->
     Subs = [{<<"a">>, 1}, {<<"b">>, 2}],
@@ -173,4 +184,160 @@ t_mqtt(Config) when is_list(Config) ->
         emqtt:disconnect(ConnPid)
     after
         ok = emqx_bridge_worker:stop(Pid)
+    end.
+
+t_stub_normal(Config) when is_list(Config) ->
+    Cfg = #{forwards => [<<"t_stub_normal/#">>],
+            connect_module => emqx_bridge_stub_conn,
+            forward_mountpoint => <<"forwarded">>,
+            start_type => auto,
+            client_pid => self()
+           },
+    {ok, Pid} = emqx_bridge_worker:start_link(?FUNCTION_NAME, Cfg),
+    receive
+        {Pid, emqx_bridge_stub_conn, ready} -> ok
+    after
+        5000 ->
+            error(timeout)
+    end,
+    ClientId = <<"ClientId">>,
+    try
+        {ok, ConnPid} = emqtt:start_link([{clientid, ClientId}]),
+        {ok, _} = emqtt:connect(ConnPid),
+        {ok, _PacketId} = emqtt:publish(ConnPid, <<"t_stub_normal/one">>, <<"hello">>, ?QOS_1),
+        receive
+            {stub_message, WorkerPid, BatchRef, _Batch} ->
+                WorkerPid ! {batch_ack, BatchRef},
+                ok
+        after
+            5000 ->
+                error(timeout)
+        end,
+        ?SNK_WAIT(inflight_drained),
+        ?SNK_WAIT(replayq_drained),
+        emqtt:disconnect(ConnPid)
+    after
+        ok = emqx_bridge_worker:stop(Pid)
+    end.
+
+t_stub_overflow(Config) when is_list(Config) ->
+    Topic = <<"t_stub_overflow/one">>,
+    MaxInflight = 20,
+    Cfg = #{forwards => [Topic],
+            connect_module => emqx_bridge_stub_conn,
+            forward_mountpoint => <<"forwarded">>,
+            start_type => auto,
+            client_pid => self(),
+            max_inflight => MaxInflight
+           },
+    {ok, Worker} = emqx_bridge_worker:start_link(?FUNCTION_NAME, Cfg),
+    ClientId = <<"ClientId">>,
+    try
+        {ok, ConnPid} = emqtt:start_link([{clientid, ClientId}]),
+        {ok, _} = emqtt:connect(ConnPid),
+        lists:foreach(
+          fun(I) ->
+                  Data = integer_to_binary(I),
+                  _ = emqtt:publish(ConnPid, Topic, Data, ?QOS_1)
+          end, lists:seq(1, MaxInflight * 2)),
+        ?SNK_WAIT(inflight_full),
+        Acks = stub_receive(MaxInflight),
+        lists:foreach(fun({Pid, Ref}) -> Pid ! {batch_ack, Ref} end, Acks),
+        Acks2 = stub_receive(MaxInflight),
+        lists:foreach(fun({Pid, Ref}) -> Pid ! {batch_ack, Ref} end, Acks2),
+        ?SNK_WAIT(inflight_drained),
+        ?SNK_WAIT(replayq_drained),
+        emqtt:disconnect(ConnPid)
+    after
+        ok = emqx_bridge_worker:stop(Worker)
+    end.
+
+t_stub_random_order(Config) when is_list(Config) ->
+    Topic = <<"t_stub_random_order/a">>,
+    MaxInflight = 10,
+    Cfg = #{forwards => [Topic],
+            connect_module => emqx_bridge_stub_conn,
+            forward_mountpoint => <<"forwarded">>,
+            start_type => auto,
+            client_pid => self(),
+            max_inflight => MaxInflight
+           },
+    {ok, Worker} = emqx_bridge_worker:start_link(?FUNCTION_NAME, Cfg),
+    ClientId = <<"ClientId">>,
+    try
+        {ok, ConnPid} = emqtt:start_link([{clientid, ClientId}]),
+        {ok, _} = emqtt:connect(ConnPid),
+        lists:foreach(
+          fun(I) ->
+                  Data = integer_to_binary(I),
+                  _ = emqtt:publish(ConnPid, Topic, Data, ?QOS_1)
+          end, lists:seq(1, MaxInflight)),
+        Acks = stub_receive(MaxInflight),
+        lists:foreach(fun({Pid, Ref}) -> Pid ! {batch_ack, Ref} end,
+                      lists:reverse(Acks)),
+        ?SNK_WAIT(inflight_drained),
+        ?SNK_WAIT(replayq_drained),
+        emqtt:disconnect(ConnPid)
+    after
+        ok = emqx_bridge_worker:stop(Worker)
+    end.
+
+t_stub_retry_inflight(Config) when is_list(Config) ->
+    Topic = <<"to_stub_retry_inflight/a">>,
+    MaxInflight = 10,
+    Cfg = #{forwards => [Topic],
+            connect_module => emqx_bridge_stub_conn,
+            forward_mountpoint => <<"forwarded">>,
+            reconnect_delay_ms => 10,
+            start_type => auto,
+            client_pid => self(),
+            max_inflight => MaxInflight
+           },
+    {ok, Worker} = emqx_bridge_worker:start_link(?FUNCTION_NAME, Cfg),
+    ClientId = <<"ClientId2">>,
+    try
+        case ?block_until(#{?snk_kind := connected, inflight := 0}, 2000, 1000) of
+            {ok, #{inflight := 0}} -> ok;
+            Other -> ct:fail("~p", [Other])
+        end,
+        {ok, ConnPid} = emqtt:start_link([{clientid, ClientId}]),
+        {ok, _} = emqtt:connect(ConnPid),
+        lists:foreach(
+          fun(I) ->
+                  Data = integer_to_binary(I),
+                  _ = emqtt:publish(ConnPid, Topic, Data, ?QOS_1)
+          end, lists:seq(1, MaxInflight)),
+        %% receive acks but do not ack
+        Acks1 = stub_receive(MaxInflight),
+        ?assertEqual(MaxInflight, length(Acks1)),
+        %% simulate a disconnect
+        Worker ! {disconnected, self(), test},
+        ?SNK_WAIT(disconnected),
+        case ?block_until(#{?snk_kind := connected, inflight := MaxInflight}, 2000, 20) of
+            {ok, _} -> ok;
+            Error -> ct:fail("~p", [Error])
+        end,
+        %% expect worker to retry inflight, so to receive acks again
+        Acks2 = stub_receive(MaxInflight),
+        ?assertEqual(MaxInflight, length(Acks2)),
+        lists:foreach(fun({Pid, Ref}) -> Pid ! {batch_ack, Ref} end,
+                      lists:reverse(Acks2)),
+        ?SNK_WAIT(inflight_drained),
+        ?SNK_WAIT(replayq_drained),
+        emqtt:disconnect(ConnPid)
+    after
+        ok = emqx_bridge_worker:stop(Worker)
+    end.
+
+stub_receive(N) ->
+    stub_receive(N, []).
+
+stub_receive(0, Acc) -> lists:reverse(Acc);
+stub_receive(N, Acc) ->
+    receive
+        {stub_message, WorkerPid, BatchRef, _Batch} ->
+            stub_receive(N - 1, [{WorkerPid, BatchRef} | Acc])
+    after
+        5000 ->
+            lists:reverse(Acc)
     end.

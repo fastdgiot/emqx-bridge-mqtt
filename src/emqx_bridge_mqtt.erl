@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -29,6 +29,12 @@
 %% optional behaviour callbacks
 -export([ ensure_subscribed/3
         , ensure_unsubscribed/2
+        ]).
+
+%% callbacks for emqtt
+-export([ handle_puback/2
+        , handle_publish/2
+        , handle_disconnected/2
         ]).
 
 -include_lib("emqx/include/logger.hrl").
@@ -86,7 +92,8 @@ ensure_subscribed(#{client_pid := Pid}, Topic, QoS) when is_pid(Pid) ->
         Error -> Error
     end;
 ensure_subscribed(_Conn, _Topic, _QoS) ->
-    %% return ok for now, next re-connect should should call start with new topic added to config
+    %% return ok for now
+    %% next re-connect should should call start with new topic added to config
     ok.
 
 ensure_unsubscribed(#{client_pid := Pid}, Topic) when is_pid(Pid) ->
@@ -95,7 +102,8 @@ ensure_unsubscribed(#{client_pid := Pid}, Topic) when is_pid(Pid) ->
         Error -> Error
     end;
 ensure_unsubscribed(_, _) ->
-    %% return ok for now, next re-connect should should call start with this topic deleted from config
+    %% return ok for now
+    %% next re-connect should should call start with this topic deleted from config
     ok.
 
 safe_stop(Pid, StopF, Timeout) ->
@@ -141,23 +149,23 @@ send(#{client_pid := ClientPid} = Conn, [Msg | Rest], PktIds) ->
             {error, Reason}
     end.
 
-handle_puback(Parent, #{packet_id := PktId, reason_code := RC})
+handle_puback(#{packet_id := PktId, reason_code := RC}, Parent)
   when RC =:= ?RC_SUCCESS;
        RC =:= ?RC_NO_MATCHING_SUBSCRIBERS ->
     Parent ! {batch_ack, PktId}, ok;
-handle_puback(_Parent, #{packet_id := PktId, reason_code := RC}) ->
+handle_puback(#{packet_id := PktId, reason_code := RC}, _Parent) ->
     ?LOG(warning, "Publish ~p to remote node falied, reason_code: ~p", [PktId, RC]).
 
 handle_publish(Msg, Mountpoint) ->
     emqx_broker:publish(emqx_bridge_msg:to_broker_msg(Msg, Mountpoint)).
 
-handle_disconnected(Parent, Reason) ->
+handle_disconnected(Reason, Parent) ->
     Parent ! {disconnected, self(), Reason}.
 
 make_hdlr(Parent, Mountpoint) ->
-    #{puback => fun(Ack) -> handle_puback(Parent, Ack) end,
-      publish => fun(Msg) -> handle_publish(Msg, Mountpoint) end,
-      disconnected => fun(Reason) -> handle_disconnected(Parent, Reason) end
+    #{puback => {fun ?MODULE:handle_puback/2, [Parent]},
+      publish => {fun ?MODULE:handle_publish/2, [Mountpoint]},
+      disconnected => {fun ?MODULE:handle_disconnected/2, [Parent]}
      }.
 
 subscribe_remote_topics(ClientPid, Subscriptions) ->
@@ -173,7 +181,7 @@ subscribe_remote_topics(ClientPid, Subscriptions) ->
 %%--------------------------------------------------------------------
 
 replvar(Options) ->
-    replvar([clientid], Options).
+    replvar([clientid, max_inflight], Options).
 
 replvar([], Options) ->
     Options;
@@ -188,5 +196,9 @@ replvar([Key|More], Options) ->
 %% ${node} => node()
 feedvar(clientid, ClientId, _) ->
     iolist_to_binary(re:replace(ClientId, "\\${node}", atom_to_list(node())));
-feedvar(_, Val, _) ->
-    Val.
+
+feedvar(max_inflight, 0, _) ->
+    infinity;
+
+feedvar(max_inflight, Size, _) ->
+    Size.

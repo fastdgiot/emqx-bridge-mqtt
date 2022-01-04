@@ -19,4 +19,3 @@ emqx_bridge_mqtt.d
 rebar.lock
 .DS_Store
 Mnesia.*/
-rebar3.crashdump

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -14,20 +14,28 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
--module(emqx_bridge_mqtt_app).
+-module(emqx_bridge_stub_conn).
 
--emqx_plugin(bridge).
+-behaviour(emqx_bridge_connect).
 
--behaviour(application).
+%% behaviour callbacks
+-export([ start/1
+        , send/2
+        , stop/1
+        ]).
 
--export([start/2, stop/1]).
+-type ack_ref() :: emqx_bridge_worker:ack_ref().
+-type batch() :: emqx_bridge_worker:batch().
 
-start(_StartType, _StartArgs) ->
-    emqx_ctl:register_command(bridges, {emqx_bridge_mqtt_cli, cli}, []),
-    emqx_bridge_worker:register_metrics(),
-    emqx_bridge_mqtt_sup:start_link().
+start(#{client_pid := Pid} = Cfg) ->
+    Pid ! {self(), ?MODULE, ready},
+    {ok, Cfg}.
 
-stop(_State) ->
-    emqx_ctl:unregister_command(bridges),
-    ok.
+stop(_) -> ok.
 
+%% @doc Callback for `emqx_bridge_connect' behaviour
+-spec send(_, batch()) -> {ok, ack_ref()} | {error, any()}.
+send(#{client_pid := Pid}, Batch) ->
+    Ref = make_ref(),
+    Pid ! {stub_message, self(), Ref, Batch},
+    {ok, Ref}.
