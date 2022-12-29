@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -45,3 +45,14 @@ send_and_ack_test() ->
     after
         meck:unload(emqtt)
     end.
+
+replvar_test() ->
+    Node = atom_to_list(node()),
+    Config = #{clientid => <<"Hey ${node}">>, topic => <<"topic ${node}">>, other => <<"other">>},
+
+    ReplacedConfig = emqx_bridge_mqtt:replvar(Config),
+
+    ExpectedConfig = #{clientid => iolist_to_binary("Hey " ++ Node),
+                       topic    => iolist_to_binary("topic " ++ Node),
+                       other    => <<"other">>},
+    ?assertEqual(ExpectedConfig, ReplacedConfig).

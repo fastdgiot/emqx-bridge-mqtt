@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -56,19 +56,7 @@ start(Module, Config) ->
         {ok, Conn} ->
             {ok, Conn};
         {error, Reason} ->
-            Config1 = obfuscate(Config),
-            ?LOG(error, "Failed to connect with module=~p\n"
-                 "config=~p\nreason:~p", [Module, Config1, Reason]),
+            ?LOG_SENSITIVE(error, "Failed to connect with module=~p\n"
+                           "config=~p\nreason:~p", [Module, Config, Reason]),
             {error, Reason}
     end.
-
-obfuscate(Map) ->
-    maps:fold(fun(K, V, Acc) ->
-                      case is_sensitive(K) of
-                          true -> [{K, '***'} | Acc];
-                          false -> [{K, V} | Acc]
-                      end
-              end, [], Map).
-
-is_sensitive(password) -> true;
-is_sensitive(_) -> false.

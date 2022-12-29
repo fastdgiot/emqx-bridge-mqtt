@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -40,6 +40,7 @@
 
 -define(RESOURCE_TYPE_MQTT, 'bridge_mqtt').
 -define(RESOURCE_TYPE_RPC, 'bridge_rpc').
+-define(BAD_TOPIC_WITH_WILDCARD, wildcard_topic_not_allowed_for_publish).
 
 -define(RESOURCE_CONFIG_SPEC_MQTT, #{
         address => #{
@@ -240,6 +241,23 @@
                        zh => <<"SSL 加密算法"/utf8>>},
             description => #{en => <<"SSL Ciphers">>,
                              zh => <<"SSL 加密算法"/utf8>>}
+        },
+        verify => #{
+            order => 19,
+            type => boolean,
+            default => false,
+            title => #{en => <<"Verify Server Certfile">>,
+                       zh => <<"校验服务器证书"/utf8>>},
+            description => #{en => <<"Whether to verify the server certificate. By default, the client will not verify the server's certificate. If verification is required, please set it to true.">>,
+                             zh => <<"是否校验服务器证书。 默认客户端不会去校验服务器的证书，如果需要校验，请设置成true。"/utf8>>}
+        },
+        server_name_indication => #{
+            order => 20,
+            type => string,
+            title => #{en => <<"Server Name Indication">>,
+                    zh => <<"服务器名称指示"/utf8>>},
+            description => #{en => <<"Specify the hostname used for peer certificate verification, or set to disable to turn off this verification.">>,
+                            zh => <<"指定用于对端证书验证时使用的主机名，或者设置为 disable 以关闭此项验证。"/utf8>>}
         }
     }).
 
@@ -404,27 +422,56 @@ start_resource(ResId, PoolName, Options) ->
             on_resource_destroy(ResId, #{<<"pool">> => PoolName}),
             start_resource(ResId, PoolName, Options);
         {error, Reason} ->
-            ?LOG(error, "Initiate Resource ~p failed, ResId: ~p, ~p", [?RESOURCE_TYPE_MQTT, ResId, Reason]),
+            ?LOG_SENSITIVE(error, "Initiate Resource ~p failed, ResId: ~p, ~p", [?RESOURCE_TYPE_MQTT, ResId, Reason]),
             on_resource_destroy(ResId, #{<<"pool">> => PoolName}),
             error({{?RESOURCE_TYPE_MQTT, ResId}, create_failed})
     end.
 
 test_resource_status(PoolName) ->
-    IsConnected = fun(Worker) ->
-                          case ecpool_worker:client(Worker) of
-                              {ok, Bridge} ->
-                                  try emqx_bridge_worker:status(Bridge) of
-                                      connected -> true;
-                                      _ -> false
-                                  catch _Error:_Reason ->
-                                          false
-                                  end;
-                              {error, _} ->
-                                  false
-                          end
-                  end,
-    Status = [IsConnected(Worker) || {_WorkerName, Worker} <- ecpool:workers(PoolName)],
-    lists:any(fun(St) -> St =:= true end, Status).
+    Parent = self(),
+    Pids = [spawn(fun() -> Parent ! {self(), get_worker_status(Worker)} end)
+            || {_WorkerName, Worker} <- ecpool:workers(PoolName)],
+    try
+        Status = [
+            receive {Pid, R} -> R
+            after 10000 -> %% get_worker_status/1 should be a quick operation
+                throw({timeout, Pid})
+            end || Pid <- Pids],
+        lists:any(fun(St) -> St =:= true end, Status)
+    catch
+        throw:Reason ->
+            ?LOG(error, "Get mqtt bridge status timeout: ~p", [Reason]),
+            lists:foreach(fun(Pid) -> exit(Pid, kill) end, Pids),
+            false
+    end.
+
+-define(RETRY_TIMES, 4).
+
+get_worker_status(Worker) ->
+    get_worker_status(Worker, ?RETRY_TIMES).
+
+get_worker_status(_Worker, 0) ->
+    false;
+get_worker_status(Worker, Times) ->
+    case ecpool_worker:client(Worker) of
+        {ok, Bridge} ->
+            try emqx_bridge_worker:status(Bridge) of
+                connected ->
+                    true;
+                idle ->
+                    ?LOG(info, "MQTT Bridge get status idle. Should not ignore this."),
+                    timer:sleep(100),
+                    get_worker_status(Worker, Times - 1);
+                ErrorStatus ->
+                    ?LOG(error, "MQTT Bridge get status ~p", [ErrorStatus]),
+                    false
+            catch Error:Reason:ST ->
+                    ?LOG(error, "MQTT Bridge get status error: ~p reason: ~p stacktrace: ~p", [Error, Reason, ST]),
+                    false
+            end;
+        {error, _} ->
+            false
+    end.
 
 -spec(on_get_resource_status(ResId::binary(), Params::map()) -> Status::map()).
 on_get_resource_status(_ResId, #{<<"pool">> := PoolName}) ->
@@ -433,13 +480,13 @@ on_get_resource_status(_ResId, #{<<"pool">> := PoolName}) ->
 
 on_resource_destroy(ResId, #{<<"pool">> := PoolName}) ->
     ?LOG(info, "Destroying Resource ~p, ResId: ~p", [?RESOURCE_TYPE_MQTT, ResId]),
-        case ecpool:stop_sup_pool(PoolName) of
-            ok ->
-                ?LOG(info, "Destroyed Resource ~p Successfully, ResId: ~p", [?RESOURCE_TYPE_MQTT, ResId]);
-            {error, Reason} ->
-                ?LOG(error, "Destroy Resource ~p failed, ResId: ~p, ~p", [?RESOURCE_TYPE_MQTT, ResId, Reason]),
-                error({{?RESOURCE_TYPE_MQTT, ResId}, destroy_failed})
-        end.
+    case ecpool:stop_sup_pool(PoolName) of
+        ok ->
+            ?LOG(info, "Destroyed Resource ~p Successfully, ResId: ~p", [?RESOURCE_TYPE_MQTT, ResId]);
+        {error, Reason} ->
+            ?LOG(error, "Destroy Resource ~p failed, ResId: ~p, ~p", [?RESOURCE_TYPE_MQTT, ResId, Reason]),
+            error({{?RESOURCE_TYPE_MQTT, ResId}, destroy_failed})
+    end.
 
 on_action_create_data_to_mqtt_broker(ActId, Opts = #{<<"pool">> := PoolName,
                                                      <<"forward_topic">> := ForwardTopic,
@@ -448,7 +495,7 @@ on_action_create_data_to_mqtt_broker(ActId, Opts = #{<<"pool">> := PoolName,
     PayloadTks = emqx_rule_utils:preproc_tmpl(PayloadTmpl),
     TopicTks = case ForwardTopic == <<"">> of
         true -> undefined;
-        false -> emqx_rule_utils:preproc_tmpl(ForwardTopic)
+        false -> emqx_rule_utils:preproc_tmpl(assert_topic_valid(ForwardTopic))
     end,
     Opts.
 
@@ -469,7 +516,7 @@ on_action_data_to_mqtt_broker(Msg, _Env =
                          qos = QoS,
                          from = From,
                          flags = Flags,
-                         topic = Topic1,
+                         topic = assert_topic_valid(Topic1),
                          payload = format_data(PayloadTks, Msg),
                          timestamp = TimeStamp},
     ecpool:with_client(PoolName,
@@ -537,7 +584,7 @@ options(Options, PoolName, ResId) ->
     Get = fun(Key) -> GetD(Key, undefined) end,
     Address = Get(<<"address">>),
     [{max_inflight_batches, 32},
-     {forward_mountpoint, str(Get(<<"mountpoint">>))},
+     {forward_mountpoint, str(assert_topic_valid(Get(<<"mountpoint">>)))},
      {disk_cache, cuttlefish_flag:parse(str(GetD(<<"disk_cache">>, "off")))},
      {start_type, auto},
      {reconnect_delay_ms, cuttlefish_duration:parse(str(Get(<<"reconnect_interval">>)), ms)},
@@ -563,6 +610,12 @@ options(Options, PoolName, ResId) ->
                   {retry_interval, cuttlefish_duration:parse(str(GetD(<<"retry_interval">>, "30s")), s)}
                   | maybe_ssl(Options, Get(<<"ssl">>), ResId)]
          end.
+
+assert_topic_valid(T) ->
+    case emqx_topic:wildcard(T) of
+        true -> throw({?BAD_TOPIC_WITH_WILDCARD, T});
+        false -> T
+    end.
 
 maybe_ssl(_Options, false, _ResId) ->
     [];

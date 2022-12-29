@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -36,6 +36,11 @@
         , handle_publish/2
         , handle_disconnected/2
         ]).
+
+%% for testing
+-ifdef(TEST).
+-export([ replvar/1 ]).
+-endif.
 
 -include_lib("emqx/include/logger.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
@@ -144,7 +149,7 @@ send(#{client_pid := ClientPid} = Conn, [Msg | Rest], PktIds) ->
         {ok, PktId} ->
             send(Conn, Rest, [PktId | PktIds]);
         {error, Reason} ->
-            %% NOTE: There is no partial sucess of a batch and recover from the middle
+            %% NOTE: There is no partial success of a batch and recover from the middle
             %% only to retry all messages in one batch
             {error, Reason}
     end.
@@ -154,7 +159,7 @@ handle_puback(#{packet_id := PktId, reason_code := RC}, Parent)
        RC =:= ?RC_NO_MATCHING_SUBSCRIBERS ->
     Parent ! {batch_ack, PktId}, ok;
 handle_puback(#{packet_id := PktId, reason_code := RC}, _Parent) ->
-    ?LOG(warning, "Publish ~p to remote node falied, reason_code: ~p", [PktId, RC]).
+    ?LOG(warning, "Publish ~p to remote node failed, reason_code: ~p", [PktId, RC]).
 
 handle_publish(Msg, Mountpoint) ->
     emqx_broker:publish(emqx_bridge_msg:to_broker_msg(Msg, Mountpoint)).
@@ -176,12 +181,12 @@ subscribe_remote_topics(ClientPid, Subscriptions) ->
                           end
                   end, Subscriptions).
 
+replvar(Options) ->
+    replvar([topic, clientid, max_inflight], Options).
+
 %%--------------------------------------------------------------------
 %% Internal funcs
 %%--------------------------------------------------------------------
-
-replvar(Options) ->
-    replvar([clientid, max_inflight], Options).
 
 replvar([], Options) ->
     Options;
@@ -194,8 +199,8 @@ replvar([Key|More], Options) ->
     end.
 
 %% ${node} => node()
-feedvar(clientid, ClientId, _) ->
-    iolist_to_binary(re:replace(ClientId, "\\${node}", atom_to_list(node())));
+feedvar(Key, Value, _) when Key =:= topic; Key =:= clientid ->
+    iolist_to_binary(re:replace(Value, "\\${node}", atom_to_list(node())));
 
 feedvar(max_inflight, 0, _) ->
     infinity;
